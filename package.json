@@ -1,0 +1,19 @@
+{
+  "name": "egydead-stremio",
+  "version": "1.0.0",
+  "description": "EgyDead addon for Stremio - movies, series and anime from tv10.egydead.live",
+  "main": "addon.js",
+  "scripts": {
+    "start": "node addon.js",
+    "test:local": "node test/local-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^153.0.0",
+    "cheerio": "^1.0.0",
+    "puppeteer-core": "^25.14.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
