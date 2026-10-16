@@ -692,6 +692,30 @@ async function handleRelayRequest(req, res, url) {
     }
     return true;
   }
+  if (url.pathname === '/relay/wecima') {
+    const target = url.searchParams.get('url');
+    if (!target) {
+      sendJson(res, 400, { ok: false, error: 'missing url param' });
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(target);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad url' });
+      return true;
+    }
+    if (!/^https?:$/.test(parsed.protocol) || parsed.hostname !== 'wecima.mobile') {
+      sendJson(res, 400, { ok: false, error: 'url must be a wecima.mobile http(s) URL' });
+      return true;
+    }
+    try {
+      sendJson(res, 200, await relayWeCima(parsed.toString()));
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
   if (url.pathname === '/relay/tattoo') {
     const target = url.searchParams.get('url');
     if (!target) {
@@ -719,6 +743,89 @@ async function handleRelayRequest(req, res, url) {
   return false;
 }
 
+// ---------------------------------------------------------------- WeCima mobile
+/**
+ * The full wecima.mobile playback protocol, server-side (the phone's
+ * direct fetches to this host throw — timeout/TLS class failures seen
+ * on-device as DEBUG "watch=err" — while the same pages answer curl and
+ * the phone's browser; the EgyDead lesson: move the chain server-side).
+ * GET /watch/{slug} (cookie jar) -> inline servers[] + watchResolveKey +
+ * csrfToken -> POST /watch/resolve {key, index} per server -> /m/{hash}
+ * fragment -> 302/meta-refresh target = the server's real embed.
+ * Returns every resolved embed (no first-hit stop).
+ */
+async function relayWeCima(watchUrl) {
+  const diag = { watch: null, servers: 0, resolved: 0 };
+  const embeds = [];
+  const jar = new CookieJar();
+  const origin = 'https://wecima.mobile';
+  let page;
+  try {
+    page = await fetchFull(watchUrl, { jar, referer: origin + '/', timeout: 30000 });
+    diag.watch = page.status;
+  } catch (e) {
+    diag.watchError = String((e && e.message) || e);
+    return { ok: false, embeds, diag };
+  }
+  const html = page.text || '';
+  const key = (html.match(/watchResolveKey\s*=\s*"([^"]+)"/) || [])[1];
+  const csrf = (html.match(/csrfToken\s*=\s*"([^"]+)"/) || [])[1];
+  let servers = [];
+  const sm = html.match(/const servers = (\[[\s\S]*?\]);/);
+  if (sm) {
+    try {
+      servers = JSON.parse(sm[1]);
+    } catch {
+      servers = [];
+    }
+  }
+  diag.servers = servers.length;
+  if (!key || !csrf || !servers.length) return { ok: false, embeds, diag };
+  const seen = new Set();
+  for (let i = 0; i < servers.length; i++) {
+    const sname = (servers[i] && servers[i].name) || `server${i}`;
+    try {
+      const r = await fetchFull(origin + '/watch/resolve', {
+        method: 'POST',
+        jar,
+        referer: watchUrl,
+        timeout: 20000,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-TOKEN': csrf,
+          'X-Requested-With': 'XMLHttpRequest',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ key, index: i }),
+      });
+      const j = JSON.parse(r.text);
+      if (!j || !j.ok || !j.url) {
+        diag[`resolve${i}`] = 'fail';
+        continue;
+      }
+      diag.resolved++;
+      const fragUrl = j.url.startsWith('http') ? j.url : origin + j.url;
+      const f = await fetchFull(fragUrl, { jar, referer: watchUrl, timeout: 15000 });
+      let embed = null;
+      if (f.finalUrl && !f.finalUrl.includes('wecima.mobile')) {
+        embed = f.finalUrl;
+      } else {
+        const mm =
+          (f.text || '').match(/url='([^']+)'/) ||
+          (f.text || '').match(/<a href="([^"]+)"/);
+        if (mm) embed = mm[1];
+      }
+      if (embed && embed.startsWith('http') && !seen.has(embed)) {
+        seen.add(embed);
+        embeds.push({ name: sname, url: embed });
+      }
+    } catch (e) {
+      diag[`resolve${i}`] = String((e && e.message) || e).slice(0, 60);
+    }
+  }
+  return { ok: embeds.length > 0, embeds, diag };
+}
+
 module.exports = {
   handleRelayRequest,
   relayEgyDead,
@@ -726,6 +833,7 @@ module.exports = {
   relayMyCima,
   relayResolve,
   relayTattoo,
+  relayWeCima,
   CookieJar,
   BROWSER_HEADERS,
 };
