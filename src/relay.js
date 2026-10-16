@@ -268,7 +268,11 @@ async function relayAnimeZid(vid) {
 
   let collected = 0;
   for (const src of ordered) {
-    if (collected >= 6) break;
+    // Resolve EVERY embedded_web source (Mohamed's rule after the هزيم
+    // الرعد miss: the user must see all the site's servers, not a capped
+    // subset — a dead first server must never hide the live ones behind
+    // it). 12 is only a runaway safety bound; real sessions carry ≤ ~8.
+    if (collected >= 12) break;
     const provider = src.provider || 'unknown';
     const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
 
