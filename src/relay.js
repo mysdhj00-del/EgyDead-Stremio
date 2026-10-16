@@ -186,6 +186,135 @@ async function relayEgyDead(targetUrl) {
 
   return { ok: embeds.length > 0 || mirrors.length > 0, embeds, mirrors, diag };
 }
+// ------------------------------------------------- deep-dig (directs)
+// Some finals' hosts hide the real stream inside Dean Edwards packed JS
+// (uqload, lulustream, vidhide/filemoon family) or a token pattern
+// (streamtape's get_video). Phone-side extractors fail on those from the
+// user's network (verified 2026-10-16: only DoodStream emitted on-device
+// while the embeds themselves were alive), so the relay digs the direct
+// stream URL out server-side and returns it alongside the finals. Hosts
+// whose flow cannot be dug statically (MixDrop's captcha gate, DoodStream
+// family's pass_md5 two-step, KrakenFiles' form) are skipped — the app's
+// extractor path still covers them where it works.
+function packerToken(i, radix) {
+  const digits = '0123456789abcdefghijklmnopqrstuvwxyz';
+  if (i === 0) return '0';
+  let s = '';
+  let n = i;
+  while (n > 0) {
+    s = digits[n % radix] + s;
+    n = Math.floor(n / radix);
+  }
+  return s;
+}
+
+function unpackPackedJs(text) {
+  const out = [];
+  const re =
+    /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('((?:[^'\\]|\\.)*)',\s*(\d+),\s*(\d+),\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)\)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const payload = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+    const radix = parseInt(m[2], 10);
+    const count = parseInt(m[3], 10);
+    const words = m[4].replace(/\\'/g, "'").split('|');
+    const map = {};
+    for (let i = 0; i < count; i++) {
+      const t = packerToken(i, radix);
+      map[t] = words[i] ? words[i] : t;
+    }
+    out.push(payload.replace(/\b\w+\b/g, (w) => (w in map ? map[w] : w)));
+  }
+  return out;
+}
+
+const DIRECT_JUNK =
+  /(\.vtt|\.svg|\.png|\.jpe?g|\.gif|logo|thumb|\/images\/|sprite)/i;
+
+function pickDirect(texts) {
+  const found = [];
+  for (const text of texts) {
+    if (!text) continue;
+    const pats = [
+      /https?:\/\/[^\s"'\\<>]+\.m3u8(?:\?[^\s"'\\<>]*)?/g,
+      /https?:\/\/[^\s"'\\<>]+\.mp4(?:\?[^\s"'\\<>]*)?/g,
+      /wurl\s*[:=]\s*["'](https?:\/\/[^"']+)["']/g,
+    ];
+    for (const p of pats) {
+      let mm;
+      while ((mm = p.exec(text)) !== null) {
+        const u = mm[1] || mm[0];
+        if (!DIRECT_JUNK.test(u) && !found.includes(u)) found.push(u);
+      }
+    }
+  }
+  if (!found.length) return null;
+  found.sort((a, b) => {
+    const score = (u) =>
+      (/master\.m3u8/.test(u) ? 0 : /\.m3u8/.test(u) ? 1 : 2);
+    return score(a) - score(b);
+  });
+  return found[0];
+}
+
+// Hosts whose stream is never statically diggable (captcha gates, pass_md5
+// or form two-steps, JS app shells) — the app's extractor path owns them.
+const DIG_SKIP_HOST =
+  /(megamax\.|mixdrop|mxdrop|krakenfiles|upns\.|dood|playmogo|ds2play|streamwish|rpmhub|rpmshare|byse|mp4upload|savefiles)/i;
+
+async function digEmbedDirect(embedUrl, referer) {
+  const page = await fetchFull(embedUrl, { referer, timeout: 9000 });
+  if (!page.text) return null;
+  const host = hostOf(page.finalUrl || embedUrl) || '';
+  if (/streamtape/.test(host)) {
+    const m = page.text.match(
+      /get_video\?id=[^"'&\s]+&expires=\d+&ip=[^"'&\s]+&token=[^"'&\s]+/
+    );
+    if (m) return `https://${host}/${m[0]}`;
+    return null;
+  }
+  return pickDirect([page.text, ...unpackPackedJs(page.text)]);
+}
+
+async function digDirects(finals, referer, diag) {
+  const seen = new Set();
+  const candidates = [];
+  for (const f of finals) {
+    if (!f.url || seen.has(f.url)) continue;
+    seen.add(f.url);
+    const host = hostOf(f.url) || '';
+    if (DIG_SKIP_HOST.test(host)) continue;
+    // The uqload .vc/.com pair is one file on two hosts — dig it once.
+    if (/^uqload\./i.test(host)) {
+      let path = f.url;
+      try {
+        path = new URL(f.url).pathname;
+      } catch {
+        /* keep full url as the key */
+      }
+      const key = 'uqload' + path;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    candidates.push(f);
+    if (candidates.length >= 12) break;
+  }
+  const directs = [];
+  const jobs = candidates.map((f) =>
+    digEmbedDirect(f.url, referer)
+      .then((direct) => {
+        if (direct) directs.push({ provider: f.provider, url: direct, via: f.url });
+      })
+      .catch(() => {})
+  );
+  await Promise.race([
+    Promise.allSettled(jobs),
+    new Promise((r) => setTimeout(r, 11000)),
+  ]);
+  diag.dug = directs.length;
+  return directs;
+}
+
 
 // --------------------------------------------------------------- AnimeZid
 const AZ_BASE = 'https://animezid.org';
@@ -387,7 +516,7 @@ async function relayAnimeZid(vid) {
   }
   finals.push(...extra);
 
-  return { ok: finals.length > 0, finals, diag };
+  const directs = await digDirects(finals, playUrl, diag); return { ok: finals.length > 0 || directs.length > 0, finals, directs, diag };
 }
 
 // ---------------------------------------------------------------- MyCima
