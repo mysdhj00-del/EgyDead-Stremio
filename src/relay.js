@@ -267,6 +267,7 @@ async function relayAnimeZid(vid) {
   const ordered = web.slice().sort((a, b) => prio(a) - prio(b));
 
   let collected = 0;
+  const startedAt = Date.now();
   for (const src of ordered) {
     // Resolve EVERY embedded_web source (Mohamed's rule after the هزيم
     // الرعد miss: the user must see all the site's servers, not a capped
@@ -274,12 +275,22 @@ async function relayAnimeZid(vid) {
     // it). 12 is only a runaway safety bound; real sessions carry ≤ ~8.
     if (collected >= 12) break;
     const provider = src.provider || 'unknown';
+    // Pace the resolves and respect an overall deadline: the site
+    // throttles bursts (429s), so back-to-back resolving kills the tail
+    // of the source list — exactly the "only one or two servers" failure
+    // Mohamed flagged. Sources past the deadline are marked, not dropped
+    // silently.
+    if (collected > 0) await sleep(1200);
+    if (Date.now() - startedAt > 110000) {
+      diag.perSource[provider] = 'skipped-deadline';
+      continue;
+    }
     const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
 
     let launchUrl = null;
     let code = null;
-    for (let attempt = 0; attempt < 2 && !launchUrl; attempt++) {
-      if (attempt > 0) await sleep(3000); // 429 backoff, one retry
+    for (let attempt = 0; attempt < 3 && !launchUrl; attempt++) {
+      if (attempt > 0) await sleep(attempt === 1 ? 4000 : 9000); // 429 backoff, two retries
       let r;
       try {
         r = await fetchFull(resolveUrl, {
@@ -294,7 +305,7 @@ async function relayAnimeZid(vid) {
         continue;
       }
       code = r.status;
-      if (r.status === 429 && attempt === 0) continue;
+      if (r.status === 429 && attempt < 2) continue;
       if (r.status >= 200 && r.status < 300) {
         try {
           const j = JSON.parse(r.text);
