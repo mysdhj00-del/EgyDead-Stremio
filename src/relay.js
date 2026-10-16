@@ -343,7 +343,36 @@ async function relayAnimeZid(vid) {
     collected++;
   }
 
-  // MegaMax finals are player pages the app has no extractor for — expand   // them here into their per-quality mirror URLs (extractor-known hosts),   // exactly like the EgyDead relay does for its embeds. Verified live on   // هزيم الرعد ep1 (2026-10-16): the mirrors (MixDrop, LuluStream, Byse,   // RPMShare, MP4Upload...) are the only playable servers left when the   // direct sources' uploads have died — the official app lists the same   // mirror set.   const extra = [];   for (const f of finals.slice()) {     if ((f.provider || '').toLowerCase() !== 'megamax') continue;     let groups = [];     try {       groups = await egy.megaMaxMirrors(f.url, playUrl);     } catch {       groups = [];     }     let n = 0;     for (const g of groups) {       for (const m of g.mirrors || []) {         if (m && !finals.some((x) => x.url === m) && !extra.some((x) => x.url === m)) {           extra.push({ provider: 'MegaMax', url: m });           n++;         }       }     }     diag.perSource.MegaMaxMirrors = n;   }   finals.push(...extra);    return { ok: finals.length > 0, finals, diag };
+  // MegaMax finals are player pages the app has no extractor for — expand
+  // them here into their per-quality mirror URLs (extractor-known hosts),
+  // exactly like the EgyDead relay does for its embeds. Verified live on
+  // هزيم الرعد ep1 (2026-10-16): the mirrors (MixDrop, LuluStream, Byse,
+  // RPMShare, MP4Upload...) are the only playable servers left when the
+  // direct sources' uploads have died — the official app lists the same
+  // mirror set.
+  const extra = [];
+  for (const f of finals.slice()) {
+    if ((f.provider || '').toLowerCase() !== 'megamax') continue;
+    let groups = [];
+    try {
+      groups = await egy.megaMaxMirrors(f.url, playUrl);
+    } catch {
+      groups = [];
+    }
+    let n = 0;
+    for (const g of groups) {
+      for (const m of g.mirrors || []) {
+        if (m && !finals.some((x) => x.url === m) && !extra.some((x) => x.url === m)) {
+          extra.push({ provider: 'MegaMax', url: m });
+          n++;
+        }
+      }
+    }
+    diag.perSource.MegaMaxMirrors = n;
+  }
+  finals.push(...extra);
+
+  return { ok: finals.length > 0, finals, diag };
 }
 
 // ---------------------------------------------------------------- MyCima
