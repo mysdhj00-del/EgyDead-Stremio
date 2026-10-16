@@ -268,7 +268,7 @@ async function relayAnimeZid(vid) {
 
   let collected = 0;
   for (const src of ordered) {
-    if (collected >= 3) break;
+    if (collected >= 6) break;
     const provider = src.provider || 'unknown';
     const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
 
