@@ -1082,6 +1082,94 @@ async function relayAnimeZidStream(vid, emit, state) {
   }
 }
 
+/**
+ * PROBE (2026-10-17 night): can this service's own headless Chromium
+ * (the tattoo stack) pass EgyDead's NEW interactive Cloudflare
+ * challenge — auto-clear or by clicking the Turnstile checkbox — and
+ * mint a cf_clearance cookie? Decides the browser-relay branch.
+ * Host-locked to egydead domains.
+ */
+async function relayBrowserTest(target) {
+  const parsed = new URL(target);
+  if (!parsed.hostname.includes('egydead')) {
+    return { ok: false, error: 'host must be an EgyDead domain' };
+  }
+  const t0 = Date.now();
+  const el = () => Date.now() - t0;
+  const browser = await getTattooBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setUserAgent(BROWSER_HEADERS['User-Agent']);
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    const state = async () => {
+      const html = await page.content().catch(() => '');
+      return { challenged: html.includes('Just a moment'), len: html.length };
+    };
+    let solvedBy = 'none';
+    for (let i = 0; i < 15; i++) {
+      const s = await state();
+      if (!s.challenged && s.len > 20000) {
+        solvedBy = 'auto';
+        break;
+      }
+      await sleep(2000);
+    }
+    let clicked = false;
+    if (solvedBy === 'none') {
+      for (const frame of page.frames()) {
+        const fu = frame.url() || '';
+        if (fu.includes('challenges.cloudflare.com') || fu.includes('turnstile')) {
+          try {
+            const box = await frame.$('input[type="checkbox"], label, body');
+            if (box) {
+              await box.click();
+              clicked = true;
+            }
+          } catch {
+            /* fall through to coordinate click */
+          }
+          if (!clicked) {
+            try {
+              const bodyEl = await frame.evaluateHandle(() => document.body);
+              const bb = await bodyEl.asElement().boundingBox();
+              if (bb) {
+                await page.mouse.click(bb.x + 30, bb.y + bb.height / 2);
+                clicked = true;
+              }
+            } catch {
+              /* no click possible */
+            }
+          }
+          break;
+        }
+      }
+      for (let i = 0; i < 20; i++) {
+        const s = await state();
+        if (!s.challenged && s.len > 20000) {
+          solvedBy = 'click';
+          break;
+        }
+        await sleep(2000);
+      }
+    }
+    const s = await state();
+    const title = await page.title().catch(() => '');
+    const cookies = await page.cookies().catch(() => []);
+    const cfCookies = cookies.filter((c) => c.name.includes('cf')).map((c) => c.name);
+    return {
+      ok: solvedBy !== 'none',
+      solvedBy,
+      clicked,
+      ms: el(),
+      title: (title || '').slice(0, 90),
+      len: s.len,
+      cfCookies,
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------- routes
 function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1389,6 +1477,30 @@ async function handleRelayRequest(req, res, url) {
     }
     try {
       sendJson(res, 200, await relayTattoo(parsed.toString()));
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
+  if (url.pathname === '/relay/browsertest') {
+    const target = url.searchParams.get('url');
+    if (!target) {
+      sendJson(res, 400, { ok: false, error: 'missing url param' });
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(target);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad url' });
+      return true;
+    }
+    if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname.includes('egydead')) {
+      sendJson(res, 400, { ok: false, error: 'url must be an EgyDead http(s) URL' });
+      return true;
+    }
+    try {
+      sendJson(res, 200, await relayBrowserTest(parsed.toString()));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
