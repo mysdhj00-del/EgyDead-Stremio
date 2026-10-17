@@ -569,7 +569,7 @@ async function relayAnimeZid(vid, wantDig = false) {
       await resolveOne(idx);
     }
   }
-  await Promise.all([worker(), worker()]);
+  await Promise.all([worker(), worker(), worker()]);
 
   for (const slot of slots) finals.push(...slot.finals);
 
