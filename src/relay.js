@@ -606,6 +606,208 @@ async function relayAnimeZid(vid, wantDig = false) {
   return { ok: finals.length > 0 || directs.length > 0, finals, directs, diag };
 }
 
+// ------------------------------------------------- AnimeZid FAST lane
+// (2026-10-17, the consolidated fix from Mohamed's solution session: the
+// full relay resolves ~13 sources and expands MegaMax before it may
+// answer (~4.5-7 s), although the phone only needs the first playable
+// candidate. The fast lane runs the same session flow, then resolves
+// sources in extractor-priority order and STOPS as soon as it holds a
+// live Doodstream final - or, when Doodstream is absent/dead, after 3
+// resolved finals. A Doodstream final is classified server-side: its
+// embed page either shows the plain "Video not found" page (a dead
+// file - measured: served without any gate) or the Cloudflare
+// Turnstile gate page (a live file whose player bootstrap sits behind
+// the gate). No MegaMax expansion here; the full endpoint stays the
+// fallback. Stage timings ride in diag.stages so a DEBUG screenshot
+// shows where the seconds went.)
+function isDoodFinal(provider, url) {
+  const p = (provider || '').toLowerCase();
+  return (
+    p.includes('dood') || p.includes('playmate') || /playmogo|doodstream|dood\./i.test(url || '')
+  );
+}
+
+async function classifyDood(url, referer) {
+  try {
+    const r = await fetchFull(url, { referer, timeout: 8000 });
+    const head = (r.text || '').slice(0, 4000);
+    if (/<title>[^<]*not found/i.test(head) || /video you are looking for is not found/i.test(head)) {
+      return 'dead';
+    }
+    return 'alive';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** One source resolve + launch follow (the fast lane's lean variant of
+ * resolveOne: 2 attempts, one short 429 backoff, no mirror work). */
+async function resolveSourceFast(src, ctx) {
+  const { createUrl, sessionId, jar, apiHeaders, playUrl, diag } = ctx;
+  const provider = src.provider || 'unknown';
+  const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
+  let launchUrl = null;
+  let code = null;
+  for (let attempt = 0; attempt < 2 && !launchUrl; attempt++) {
+    if (attempt > 0) await sleep(2500);
+    let r;
+    try {
+      r = await fetchFull(resolveUrl, {
+        method: 'POST',
+        jar,
+        referer: playUrl,
+        headers: apiHeaders,
+        body: '{}',
+      });
+    } catch {
+      code = 'error';
+      continue;
+    }
+    code = r.status;
+    if (r.status === 429 && attempt < 1) continue;
+    if (r.status >= 200 && r.status < 300) {
+      try {
+        const j = JSON.parse(r.text);
+        launchUrl = j.launch_url || j.launchUrl || j.url || null;
+      } catch {
+        launchUrl = null;
+      }
+    }
+  }
+  if (!launchUrl) {
+    diag.perSource[provider] = code;
+    return null;
+  }
+  let absLaunch;
+  try {
+    absLaunch = new URL(launchUrl, AZ_BASE).toString();
+  } catch {
+    diag.perSource[provider] = 'bad-launch-url';
+    return null;
+  }
+  let finalUrl = null;
+  try {
+    finalUrl = await followLaunch(absLaunch, { jar, referer: playUrl, timeout: 20000 });
+  } catch {
+    diag.perSource[provider] = 'launch-error';
+    return null;
+  }
+  if (!finalUrl) {
+    diag.perSource[provider] = 'launch-empty';
+    return null;
+  }
+  diag.perSource[provider] = hostOf(finalUrl) || finalUrl;
+  return finalUrl;
+}
+
+async function relayAnimeZidFast(vid) {
+  const t0 = Date.now();
+  const diag = { fast: 1, protected: null, sourceCount: 0, perSource: {}, stages: {} };
+  const finals = [];
+  const jar = new CookieJar();
+  const playUrl = `${AZ_BASE}/play.php?vid=${encodeURIComponent(vid)}`;
+
+  const play = await fetchFull(playUrl, {
+    jar,
+    referer: `${AZ_BASE}/watch.php?vid=${encodeURIComponent(vid)}`,
+  });
+  diag.stages.playMs = Date.now() - t0;
+  const $ = cheerio.load(play.text);
+  const holder = $('[data-playback-create-url]').first();
+  const prot = holder.attr('data-playback-protected');
+  diag.protected = prot === undefined ? null : prot;
+  const csrf = holder.attr('data-playback-csrf');
+  let createUrl = holder.attr('data-playback-create-url');
+  if (!csrf || !createUrl) {
+    diag.stages.totalMs = Date.now() - t0;
+    return {
+      ok: false, fast: true, ds: 'none', finals, directs: [], diag,
+      error: `playback attrs missing (HTTP ${play.status})`,
+    };
+  }
+  createUrl = new URL(createUrl, AZ_BASE).toString().replace(/\/+$/, '');
+
+  const apiHeaders = {
+    'X-Playback-CSRF': csrf,
+    'Content-Type': 'application/json',
+    Origin: AZ_BASE,
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+  };
+  const tSess = Date.now();
+  const sessRes = await fetchFull(createUrl, {
+    method: 'POST',
+    jar,
+    referer: playUrl,
+    headers: apiHeaders,
+    body: JSON.stringify({ content_id: vid }),
+  });
+  diag.stages.sessionMs = Date.now() - tSess;
+  let session = null;
+  try {
+    session = JSON.parse(sessRes.text);
+  } catch {
+    session = null;
+  }
+  if (!session || !session.session_id) {
+    diag.stages.totalMs = Date.now() - t0;
+    return {
+      ok: false, fast: true, ds: 'none', finals, directs: [], diag,
+      error: `session create failed: HTTP ${sessRes.status}`,
+    };
+  }
+  const sessionId = session.session_id;
+
+  const allSources = Array.isArray(session.sources) ? session.sources : [];
+  const web = allSources.filter((s) => s && s.type === 'embedded_web');
+  diag.sourceCount = web.length;
+  const prio = (s) => {
+    const i = AZ_PRIORITY.indexOf(s.provider || '');
+    return i === -1 ? AZ_PRIORITY.length : i;
+  };
+  const ordered = web.slice().sort((a, b) => prio(a) - prio(b));
+
+  const tRes = Date.now();
+  let ds = 'none';
+  for (const src of ordered) {
+    if (ds === 'alive') break;
+    if (finals.length >= 3) break;
+    if (Date.now() - t0 > 9000) {
+      diag.stopped = 'cap';
+      break;
+    }
+    const provider = src.provider || 'unknown';
+    if (provider.toLowerCase() === 'megamax') continue;
+    const finalUrl = await resolveSourceFast(src, {
+      createUrl,
+      sessionId,
+      jar,
+      apiHeaders,
+      playUrl,
+      diag,
+    });
+    if (!finalUrl) continue;
+    finals.push({ provider, url: finalUrl });
+    try {
+      const u = new URL(finalUrl);
+      if (/^uqload\./i.test(u.hostname) && u.hostname.toLowerCase() !== 'uqload.com') {
+        u.hostname = 'uqload.com';
+        finals.push({ provider, url: u.toString() });
+      }
+    } catch {
+      /* finalUrl already recorded */
+    }
+    if (isDoodFinal(provider, finalUrl)) {
+      ds = await classifyDood(finalUrl, playUrl);
+      diag.ds = ds;
+    }
+  }
+  diag.stages.resolveMs = Date.now() - tRes;
+  diag.stages.totalMs = Date.now() - t0;
+  return { ok: finals.length > 0, fast: true, ds, finals, directs: [], diag };
+}
+
 // ---------------------------------------------------------------- MyCima
 const MC_BASE = 'https://vid.mycima.cc';
 
@@ -887,7 +1089,12 @@ async function handleRelayRequest(req, res, url) {
       return true;
     }
     try {
-      sendJson(res, 200, await relayAnimeZid(vid, url.searchParams.get('dig') === '1'));
+      const t0 = Date.now();
+      const out = url.searchParams.get('fast') === '1'
+        ? await relayAnimeZidFast(vid)
+        : await relayAnimeZid(vid, url.searchParams.get('dig') === '1');
+      if (out && out.diag) out.diag.totalMs = Date.now() - t0;
+      sendJson(res, 200, out);
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
