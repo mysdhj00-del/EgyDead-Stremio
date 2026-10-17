@@ -14,6 +14,7 @@
     "@sparticuz/chromium": "^153.0.0",
     "cheerio": "^1.0.0",
     "puppeteer-core": "^25.14.0",
-    "stremio-addon-sdk": "^1.6.10"
+    "stremio-addon-sdk": "^1.6.10",
+    "impit": "^0.14.6"
   }
 }
