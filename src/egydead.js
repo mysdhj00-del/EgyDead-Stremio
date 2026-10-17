@@ -16,6 +16,7 @@
  *   quality, mirror links on well-known video hosts.
  */
 const cheerio = require('cheerio');
+const { impFetch } = require('./impfetch');
 
 const BASE = (process.env.EGYDEAD_BASE || 'https://tv10.egydead.live').replace(/\/+$/, '');
 const UA =
@@ -25,7 +26,7 @@ async function fetchText(url, opts = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeout || 25000);
   try {
-    const res = await fetch(url, {
+    const res = await impFetch(url, {
       method: opts.method || 'GET',
       body: opts.body,
       redirect: 'follow',

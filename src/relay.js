@@ -23,6 +23,7 @@
  */
 const cheerio = require('cheerio');
 const egy = require('./egydead');
+const { impFetch } = require('./impfetch');
 
 // Desktop Chrome header set used for every upstream call (verified live
 // 2026-10-15: both sites gate their playback steps on browser-like requests).
@@ -86,6 +87,36 @@ class CookieJar {
   }
 }
 
+/**
+ * Same contract as fetchFull, but through the Chrome-impersonating client
+ * (see impfetch.js) — required for egydead.live since its 2026-10-17
+ * Cloudflare fingerprint wall rejects plain fetch with a 403 challenge.
+ */
+async function fetchImp(url, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeout || 25000);
+  try {
+    const headers = { ...BROWSER_HEADERS, ...(opts.headers || {}) };
+    if (opts.referer) headers.Referer = opts.referer;
+    if (opts.jar) {
+      const cookie = opts.jar.headerFor(url);
+      if (cookie) headers.Cookie = cookie;
+    }
+    const res = await impFetch(url, {
+      method: opts.method || 'GET',
+      body: opts.body,
+      redirect: 'follow',
+      signal: controller.signal,
+      headers,
+    });
+    if (opts.jar) opts.jar.store(res, url);
+    const text = await res.text();
+    return { status: res.status, text, finalUrl: res.url };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** fetch() that reports status + final URL and can carry a CookieJar. */
 async function fetchFull(url, opts = {}) {
   const controller = new AbortController();
@@ -119,7 +150,7 @@ async function relayEgyDead(targetUrl) {
 
   // a. Warm GET (also seeds any session cookies for the POST).
   try {
-    const g = await fetchFull(targetUrl, { jar, referer: egy.BASE + '/' });
+    const g = await fetchImp(targetUrl, { jar, referer: egy.BASE + '/' });
     diag.getCode = g.status;
   } catch (e) {
     diag.getError = String((e && e.message) || e);
@@ -128,7 +159,7 @@ async function relayEgyDead(targetUrl) {
   // b. POST View=1 (form-encoded) to the same URL — the watch unlock.
   let postHtml = '';
   try {
-    const p = await fetchFull(targetUrl, {
+    const p = await fetchImp(targetUrl, {
       method: 'POST',
       jar,
       referer: targetUrl,
@@ -186,6 +217,24 @@ async function relayEgyDead(targetUrl) {
 
   return { ok: embeds.length > 0 || mirrors.length > 0, embeds, mirrors, diag };
 }
+
+// --------------------------------------------------------------- AnimeZid
+const AZ_BASE = 'https://animezid.org';
+// Extractor-support order (same reasoning as the provider's v2: hosts the
+// CloudStream app can actually play first; SPA shells / hang-prone last).
+const AZ_PRIORITY = [
+  'PlayMate',
+  'DoodStream',
+  'Uqload',
+  'Abyss',
+  'VidTube',
+  'StreamP2P',
+  'UPNShare',
+  'RPMShare',
+  'StreamRuby',
+  'MegaMax',
+];
+
 // ------------------------------------------------- deep-dig (directs)
 // Some finals' hosts hide the real stream inside Dean Edwards packed JS
 // (uqload, lulustream, vidhide/filemoon family) or a token pattern
@@ -314,24 +363,6 @@ async function digDirects(finals, referer, diag) {
   diag.dug = directs.length;
   return directs;
 }
-
-
-// --------------------------------------------------------------- AnimeZid
-const AZ_BASE = 'https://animezid.org';
-// Extractor-support order (same reasoning as the provider's v2: hosts the
-// CloudStream app can actually play first; SPA shells / hang-prone last).
-const AZ_PRIORITY = [
-  'PlayMate',
-  'DoodStream',
-  'Uqload',
-  'Abyss',
-  'VidTube',
-  'StreamP2P',
-  'UPNShare',
-  'RPMShare',
-  'StreamRuby',
-  'MegaMax',
-];
 
 async function relayAnimeZid(vid) {
   const diag = { protected: null, sourceCount: 0, perSource: {} };
@@ -516,7 +547,11 @@ async function relayAnimeZid(vid) {
   }
   finals.push(...extra);
 
-  const directs = await digDirects(finals, playUrl, diag); return { ok: finals.length > 0 || directs.length > 0, finals, directs, diag };
+  // Deep-dig direct stream URLs server-side for the hosts the phone's
+  // extractors cannot open from the user's network (packed-JS players).
+  const directs = await digDirects(finals, playUrl, diag);
+
+  return { ok: finals.length > 0 || directs.length > 0, finals, directs, diag };
 }
 
 // ---------------------------------------------------------------- MyCima
@@ -755,6 +790,39 @@ async function handleRelayRequest(req, res, url) {
     }
     try {
       sendJson(res, 200, await relayEgyDead(parsed.toString()));
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
+  if (url.pathname === '/relay/page') {
+    const target = url.searchParams.get('url');
+    if (!target) {
+      sendJson(res, 400, { ok: false, error: 'missing url param' });
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(target);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad url' });
+      return true;
+    }
+    if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname.includes('egydead')) {
+      sendJson(res, 400, { ok: false, error: 'url must be an EgyDead http(s) URL' });
+      return true;
+    }
+    try {
+      const r = await fetchImp(parsed.toString(), {
+        referer: 'https://' + parsed.hostname + '/',
+        timeout: 30000,
+      });
+      sendJson(res, 200, {
+        ok: r.status === 200,
+        code: r.status,
+        finalUrl: r.finalUrl,
+        text: (r.text || '').slice(0, 2500000),
+      });
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
