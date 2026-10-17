@@ -117,6 +117,42 @@ async function fetchImp(url, opts = {}) {
   }
 }
 
+/**
+ * Follows a launch URL by hand (redirect: 'manual'), returning the final
+ * URL WITHOUT downloading the target page's body. The old flow fetched the
+ * whole embed page per source just to learn where the 302 landed; on slow
+ * hosts that was a large share of the relay's ~15 s. Cookies are stored
+ * and re-sent per hop exactly like the jar flow in fetchFull.
+ */
+async function followLaunch(url, opts = {}) {
+  let current = url;
+  for (let hop = 0; hop < 5; hop++) {
+    const headers = { ...BROWSER_HEADERS, ...(opts.headers || {}) };
+    if (opts.referer) headers.Referer = opts.referer;
+    if (opts.jar) {
+      const cookie = opts.jar.headerFor(current);
+      if (cookie) headers.Cookie = cookie;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opts.timeout || 20000);
+    let res;
+    try {
+      res = await fetch(current, { redirect: 'manual', signal: controller.signal, headers });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (opts.jar) opts.jar.store(res, current);
+    const loc = res.headers.get('location');
+    if (res.body) res.body.cancel().catch(() => {});
+    if (res.status >= 300 && res.status < 400 && loc) {
+      current = new URL(loc, current).toString();
+      continue;
+    }
+    return current;
+  }
+  return current;
+}
+
 /** fetch() that reports status + final URL and can carry a CookieJar. */
 async function fetchFull(url, opts = {}) {
   const controller = new AbortController();
@@ -364,7 +400,7 @@ async function digDirects(finals, referer, diag) {
   return directs;
 }
 
-async function relayAnimeZid(vid) {
+async function relayAnimeZid(vid, wantDig = false) {
   const diag = { protected: null, sourceCount: 0, perSource: {} };
   const finals = [];
   const jar = new CookieJar();
@@ -426,24 +462,25 @@ async function relayAnimeZid(vid) {
   };
   const ordered = web.slice().sort((a, b) => prio(a) - prio(b));
 
-  let collected = 0;
-  const startedAt = Date.now();
-  for (const src of ordered) {
-    // Resolve EVERY embedded_web source (Mohamed's rule after the هزيم
-    // الرعد miss: the user must see all the site's servers, not a capped
-    // subset — a dead first server must never hide the live ones behind
-    // it). 12 is only a runaway safety bound; real sessions carry ≤ ~8.
-    if (collected >= 12) break;
+  // Resolve the sources with bounded concurrency (2 workers). The old
+  // strictly-sequential flow (1.2 s pacing between sources) made every
+  // relay call take ~15 s before the phone could start. Two-at-a-time
+  // with the same 429 backoff keeps the site's throttle at bay (the
+  // backoff rescues a throttled source locally, in parallel) while
+  // roughly halving the wait. Results land in per-source slots so the
+  // finals keep their priority order regardless of completion order.
+  const slots = ordered.map(() => ({ finals: [], mirrorsPromise: null }));
+  let nextIdx = 0;
+  let collectedCount = 0;
+
+  async function resolveOne(idx) {
+    const src = ordered[idx];
+    const slot = slots[idx];
     const provider = src.provider || 'unknown';
-    // Pace the resolves and respect an overall deadline: the site
-    // throttles bursts (429s), so back-to-back resolving kills the tail
-    // of the source list — exactly the "only one or two servers" failure
-    // Mohamed flagged. Sources past the deadline are marked, not dropped
-    // silently.
-    if (collected > 0) await sleep(1200);
+    if (collectedCount >= 12) return;
     if (Date.now() - startedAt > 110000) {
       diag.perSource[provider] = 'skipped-deadline';
-      continue;
+      return;
     }
     const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
 
@@ -477,32 +514,32 @@ async function relayAnimeZid(vid) {
     }
     if (!launchUrl) {
       diag.perSource[provider] = code;
-      continue;
+      return;
     }
 
     // Follow the launch WITH the session cookies — without them the site
-    // answers HTTP 410 and stays on animezid.org (verified live).
+    // answers HTTP 410 and stays on animezid.org (verified live). Only the
+    // redirect chain is walked; the embed page body is never downloaded.
     let absLaunch;
     try {
       absLaunch = new URL(launchUrl, AZ_BASE).toString();
     } catch {
       diag.perSource[provider] = 'bad-launch-url';
-      continue;
+      return;
     }
     let finalUrl = null;
     try {
-      const l = await fetchFull(absLaunch, { jar, referer: playUrl, timeout: 20000 });
-      finalUrl = l.finalUrl;
+      finalUrl = await followLaunch(absLaunch, { jar, referer: playUrl, timeout: 20000 });
     } catch {
       diag.perSource[provider] = 'launch-error';
-      continue;
+      return;
     }
     if (!finalUrl) {
       diag.perSource[provider] = 'launch-empty';
-      continue;
+      return;
     }
     diag.perSource[provider] = hostOf(finalUrl) || finalUrl;
-    finals.push({ provider, url: finalUrl });
+    slot.finals.push({ provider, url: finalUrl });
 
     // The CloudStream Uqload extractor doesn't know the .vc TLD; the same
     // embed path works on the canonical uqload.com host.
@@ -510,46 +547,61 @@ async function relayAnimeZid(vid) {
       const u = new URL(finalUrl);
       if (/^uqload\./i.test(u.hostname) && u.hostname.toLowerCase() !== 'uqload.com') {
         u.hostname = 'uqload.com';
-        finals.push({ provider, url: u.toString() });
+        slot.finals.push({ provider, url: u.toString() });
       }
     } catch {
       /* finalUrl already recorded */
     }
-    collected++;
+    collectedCount++;
+
+    // MegaMax finals are player pages the app has no extractor for —
+    // start expanding this one into its per-quality mirrors right away,
+    // in parallel with the remaining resolves.
+    if (provider.toLowerCase() === 'megamax') {
+      slot.mirrorsPromise = egy.megaMaxMirrors(finalUrl, playUrl).catch(() => []);
+    }
   }
 
-  // MegaMax finals are player pages the app has no extractor for — expand
-  // them here into their per-quality mirror URLs (extractor-known hosts),
-  // exactly like the EgyDead relay does for its embeds. Verified live on
-  // هزيم الرعد ep1 (2026-10-16): the mirrors (MixDrop, LuluStream, Byse,
-  // RPMShare, MP4Upload...) are the only playable servers left when the
-  // direct sources' uploads have died — the official app lists the same
-  // mirror set.
-  const extra = [];
-  for (const f of finals.slice()) {
-    if ((f.provider || '').toLowerCase() !== 'megamax') continue;
-    let groups = [];
-    try {
-      groups = await egy.megaMaxMirrors(f.url, playUrl);
-    } catch {
-      groups = [];
+  const startedAt = Date.now();
+  async function worker() {
+    while (nextIdx < ordered.length) {
+      const idx = nextIdx++;
+      await resolveOne(idx);
     }
-    let n = 0;
+  }
+  await Promise.all([worker(), worker()]);
+
+  for (const slot of slots) finals.push(...slot.finals);
+
+  // MegaMax mirrors, merged in source order (the expansions were started
+  // during the resolve phase, so this is mostly just awaiting them).
+  // Verified live on هزيم الرعد ep1 (2026-10-16): the mirrors (MixDrop,
+  // LuluStream, Byse, RPMShare, MP4Upload...) are the only playable
+  // servers left when the direct sources' uploads have died — the
+  // official app lists the same mirror set.
+  const extra = [];
+  let mirrorTotal = 0;
+  for (const slot of slots) {
+    if (!slot.mirrorsPromise) continue;
+    const groups = (await slot.mirrorsPromise) || [];
     for (const g of groups) {
       for (const m of g.mirrors || []) {
         if (m && !finals.some((x) => x.url === m) && !extra.some((x) => x.url === m)) {
           extra.push({ provider: 'MegaMax', url: m });
-          n++;
+          mirrorTotal++;
         }
       }
     }
-    diag.perSource.MegaMaxMirrors = n;
   }
+  diag.perSource.MegaMaxMirrors = mirrorTotal;
   finals.push(...extra);
 
-  // Deep-dig direct stream URLs server-side for the hosts the phone's
-  // extractors cannot open from the user's network (packed-JS players).
-  const directs = await digDirects(finals, playUrl, diag);
+  // Deep-dig direct stream URLs server-side ONLY on explicit request
+  // (dig=1). Since 2026-10-17 this is off by default: stream tokens are
+  // IP-bound to the fetching IP, so the phone cannot play server-dug
+  // directs anyway, and the dig stage (up to ~11s) delayed every
+  // response. The provider digs on the phone itself (its own IP).
+  const directs = wantDig ? await digDirects(finals, playUrl, diag) : [];
 
   return { ok: finals.length > 0 || directs.length > 0, finals, directs, diag };
 }
@@ -835,7 +887,7 @@ async function handleRelayRequest(req, res, url) {
       return true;
     }
     try {
-      sendJson(res, 200, await relayAnimeZid(vid));
+      sendJson(res, 200, await relayAnimeZid(vid, url.searchParams.get('dig') === '1'));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
