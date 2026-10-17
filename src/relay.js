@@ -914,6 +914,174 @@ async function relayResolve(target, ref) {
   return { ok: direct.length > 0, direct, diag };
 }
 
+/**
+ * v11 STREAMING variant of the AnimeZid relay: same protected session
+ * flow and the same resolve discipline as relayAnimeZid, but every
+ * final is emitted (NDJSON line via [emit]) THE MOMENT it lands
+ * instead of after the whole pool finishes — the phone starts its
+ * extractor pass on the first arrivals while the rest keep resolving.
+ * MegaMax mirrors are emitted from inside the worker as soon as that
+ * source's expansion returns. [state.aborted] is set by the route
+ * when the client disconnects; workers stop starting new resolves.
+ */
+async function relayAnimeZidStream(vid, emit, state) {
+  const t0 = Date.now();
+  const diag = { stages: {}, perSource: {}, sourceCount: 0 };
+  const jar = new CookieJar();
+  const playUrl = `${AZ_BASE}/play.php?vid=${encodeURIComponent(vid)}`;
+  let count = 0;
+  const sendFinal = (provider, url) => {
+    count++;
+    emit({ t: 'final', provider, url });
+  };
+  try {
+    const play = await fetchFull(playUrl, {
+      jar,
+      referer: `${AZ_BASE}/watch.php?vid=${encodeURIComponent(vid)}`,
+    });
+    diag.stages.playMs = Date.now() - t0;
+    emit({ t: 'stage', name: 'play', ms: diag.stages.playMs });
+    const $ = cheerio.load(play.text);
+    const holder = $('[data-playback-create-url]').first();
+    const csrf = holder.attr('data-playback-csrf');
+    let createUrl = holder.attr('data-playback-create-url');
+    if (!csrf || !createUrl) {
+      emit({ t: 'done', ok: false, count, error: `playback attrs missing (HTTP ${play.status})`, diag });
+      return;
+    }
+    createUrl = new URL(createUrl, AZ_BASE).toString().replace(/\/+$/, '');
+    const apiHeaders = {
+      'X-Playback-CSRF': csrf,
+      'Content-Type': 'application/json',
+      Origin: AZ_BASE,
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+    };
+    const tSess = Date.now();
+    const sessRes = await fetchFull(createUrl, {
+      method: 'POST',
+      jar,
+      referer: playUrl,
+      headers: apiHeaders,
+      body: JSON.stringify({ content_id: vid }),
+    });
+    diag.stages.sessionMs = Date.now() - tSess;
+    emit({ t: 'stage', name: 'session', ms: diag.stages.sessionMs });
+    let session = null;
+    try {
+      session = JSON.parse(sessRes.text);
+    } catch {
+      session = null;
+    }
+    if (!session || !session.session_id) {
+      emit({ t: 'done', ok: false, count, error: `session create failed: HTTP ${sessRes.status}`, diag });
+      return;
+    }
+    const sessionId = session.session_id;
+    const allSources = Array.isArray(session.sources) ? session.sources : [];
+    const web = allSources.filter((s) => s && s.type === 'embedded_web');
+    diag.sourceCount = web.length;
+    const prio = (s) => {
+      const i = AZ_PRIORITY.indexOf(s.provider || '');
+      return i === -1 ? AZ_PRIORITY.length : i;
+    };
+    const ordered = web.slice().sort((a, b) => prio(a) - prio(b));
+    let nextIdx = 0;
+
+    async function resolveOneS(idx) {
+      if (state.aborted) return;
+      const src = ordered[idx];
+      const provider = src.provider || 'unknown';
+      if (count >= 40) return;
+      if (Date.now() - t0 > 60000) {
+        diag.perSource[provider] = 'skipped-deadline';
+        return;
+      }
+      const resolveUrl = `${createUrl}/${sessionId}/sources/${src.id}/resolve`;
+      let launchUrl = null;
+      let code = null;
+      for (let attempt = 0; attempt < 3 && !launchUrl; attempt++) {
+        if (attempt > 0) await sleep(attempt === 1 ? 4000 : 9000);
+        let r;
+        try {
+          r = await fetchFull(resolveUrl, {
+            method: 'POST',
+            jar,
+            referer: playUrl,
+            headers: apiHeaders,
+            body: '{}',
+          });
+        } catch {
+          code = 'error';
+          continue;
+        }
+        code = r.status;
+        if (r.status === 429 && attempt < 2) continue;
+        if (r.status >= 200 && r.status < 300) {
+          try {
+            const j = JSON.parse(r.text);
+            launchUrl = j.launch_url || j.launchUrl || j.url || null;
+          } catch {
+            launchUrl = null;
+          }
+        }
+      }
+      if (!launchUrl) {
+        diag.perSource[provider] = code;
+        return;
+      }
+      let absLaunch;
+      try {
+        absLaunch = new URL(launchUrl, AZ_BASE).toString();
+      } catch {
+        diag.perSource[provider] = 'bad-launch-url';
+        return;
+      }
+      let finalUrl = null;
+      try {
+        finalUrl = await followLaunch(absLaunch, { jar, referer: playUrl, timeout: 20000 });
+      } catch {
+        diag.perSource[provider] = 'launch-error';
+        return;
+      }
+      if (!finalUrl) {
+        diag.perSource[provider] = 'launch-empty';
+        return;
+      }
+      diag.perSource[provider] = hostOf(finalUrl) || finalUrl;
+      sendFinal(provider, finalUrl);
+      try {
+        const u = new URL(finalUrl);
+        if (/^uqload\./i.test(u.hostname) && u.hostname.toLowerCase() !== 'uqload.com') {
+          u.hostname = 'uqload.com';
+          sendFinal(provider, u.toString());
+        }
+      } catch {
+        /* finalUrl already emitted */
+      }
+      if (provider.toLowerCase() === 'megamax') {
+        const mirrors = await egy.megaMaxMirrors(finalUrl, playUrl).catch(() => []);
+        for (const m of mirrors) sendFinal('MegaMax', m);
+      }
+    }
+
+    async function worker() {
+      while (!state.aborted && nextIdx < ordered.length) {
+        const idx = nextIdx++;
+        await resolveOneS(idx);
+      }
+    }
+    await Promise.all([worker(), worker(), worker()]);
+    diag.stages.resolveMs = Date.now() - t0 - diag.stages.playMs - diag.stages.sessionMs;
+    diag.totalMs = Date.now() - t0;
+    emit({ t: 'done', ok: count > 0, count, diag });
+  } catch (e) {
+    diag.totalMs = Date.now() - t0;
+    emit({ t: 'done', ok: false, count, error: String((e && e.message) || e), diag });
+  }
+}
+
 // ---------------------------------------------------------------- routes
 function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1086,6 +1254,36 @@ async function handleRelayRequest(req, res, url) {
     const vid = url.searchParams.get('vid');
     if (!vid || !/^[A-Za-z0-9_-]+$/.test(vid)) {
       sendJson(res, 400, { ok: false, error: 'missing/bad vid param' });
+      return true;
+    }
+    if (url.searchParams.get('stream') === '1') {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+      });
+      const state = { aborted: false };
+      res.on('close', () => {
+        state.aborted = true;
+      });
+      const emit = (obj) => {
+        if (state.aborted) return;
+        try {
+          res.write(`${JSON.stringify(obj)}\n`);
+        } catch {
+          state.aborted = true;
+        }
+      };
+      try {
+        await relayAnimeZidStream(vid, emit, state);
+      } catch (e) {
+        emit({ t: 'done', ok: false, error: String((e && e.message) || e) });
+      }
+      try {
+        res.end();
+      } catch {
+        /* already closed */
+      }
       return true;
     }
     try {
