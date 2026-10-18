@@ -1678,6 +1678,58 @@ async function handleRelayRequest(req, res, url) {
     }
     return true;
   }
+  if (url.pathname === '/relay/raw') {
+    // Diagnostic body fetch (key-gated): returns the first 20 KB of a
+    // page exactly as THIS egress sees it, so provider scans can be
+    // designed against the real bodies of hosts that wall the sandbox
+    // (added 2026-10-19 for the dramaramadan Server API class).
+    if (url.searchParams.get('k') !== HITS_KEY) {
+      sendJson(res, 403, { ok: false, error: 'bad key' });
+      return true;
+    }
+    const target = url.searchParams.get('url');
+    if (!target) {
+      sendJson(res, 400, { ok: false, error: 'missing url param' });
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(target);
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'bad url' });
+      return true;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+      !/^https?:$/.test(parsed.protocol) ||
+      host === 'localhost' ||
+      host === '::1' ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    ) {
+      sendJson(res, 400, { ok: false, error: 'url must be a public http(s) URL' });
+      return true;
+    }
+    const ref = url.searchParams.get('ref') || '';
+    try {
+      const page = await fetchFull(parsed.toString(), {
+        timeout: 25000,
+        referer: ref || parsed.origin + '/',
+      });
+      sendJson(res, 200, {
+        ok: true,
+        code: page.status,
+        finalUrl: page.finalUrl,
+        body: (page.text || '').slice(0, 20000),
+      });
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
   if (url.pathname === '/relay/ping') {
     // v21 stage beacon for the EgyDead provider: log-only endpoint.
     logHit('ping', {
