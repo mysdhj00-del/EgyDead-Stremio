@@ -1678,6 +1678,17 @@ async function handleRelayRequest(req, res, url) {
     }
     return true;
   }
+  if (url.pathname === '/relay/ping') {
+    // v21 stage beacon for the EgyDead provider: log-only endpoint.
+    logHit('ping', {
+      stage: url.searchParams.get('stage') || '',
+      n: url.searchParams.get('n') || '',
+      pv: url.searchParams.get('pv') || '',
+      door: 'render',
+    });
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
   if (url.pathname === '/relay/hits') {
     if (url.searchParams.get('k') !== HITS_KEY) {
       sendJson(res, 403, { ok: false, error: 'bad key' });
