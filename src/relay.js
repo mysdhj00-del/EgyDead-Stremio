@@ -1213,7 +1213,11 @@ function proxyBase(req) {
 }
 
 function hlsProxyUrl(req, target, referer) {
-  return `${proxyBase(req)}/relay/hls?u=${encodeURIComponent(b64e(target))}&r=${encodeURIComponent(b64e(referer))}`;
+  // The path ends in /m.m3u8 on purpose: CloudStream has URL-based type
+  // inference and some player paths sniff the URL — a bare query-string
+  // endpoint can be misclassified before the explicit link type is even
+  // consulted (panel round 5). The route accepts any /relay/hls/* path.
+  return `${proxyBase(req)}/relay/hls/m.m3u8?u=${encodeURIComponent(b64e(target))}&r=${encodeURIComponent(b64e(referer))}`;
 }
 
 function isVidHost(host) {
@@ -1694,7 +1698,7 @@ async function handleRelayRequest(req, res, url) {
     }
     return true;
   }
-  if (url.pathname === '/relay/hls') {
+  if (url.pathname === '/relay/hls' || url.pathname.startsWith('/relay/hls/')) {
     const target = b64d(url.searchParams.get('u'));
     const referer = b64d(url.searchParams.get('r'));
     if (!target) {
