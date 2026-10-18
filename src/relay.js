@@ -1212,12 +1212,13 @@ function proxyBase(req) {
   return `${proto}://${host}`;
 }
 
-function hlsProxyUrl(req, target, referer) {
+function hlsProxyUrl(req, target, referer, pv) {
   // The path ends in /m.m3u8 on purpose: CloudStream has URL-based type
   // inference and some player paths sniff the URL — a bare query-string
   // endpoint can be misclassified before the explicit link type is even
   // consulted (panel round 5). The route accepts any /relay/hls/* path.
-  return `${proxyBase(req)}/relay/hls/m.m3u8?u=${encodeURIComponent(b64e(target))}&r=${encodeURIComponent(b64e(referer))}`;
+  const p = pv ? `&pv=${encodeURIComponent(pv)}` : '';
+  return `${proxyBase(req)}/relay/hls/m.m3u8?u=${encodeURIComponent(b64e(target))}&r=${encodeURIComponent(b64e(referer))}${p}`;
 }
 
 function isVidHost(host) {
@@ -1225,15 +1226,15 @@ function isVidHost(host) {
   return h === 'egybestvid.com' || h.endsWith('.egybestvid.com');
 }
 
-async function relayVid(req, src) {
+async function relayVid(req, src, pv) {
   const parsed = new URL(src);
   if (!isVidHost(parsed.hostname)) {
     return { ok: false, error: 'src must be an egybestvid embed URL' };
   }
   const cached = vidCache.get(src);
   if (cached && Date.now() - cached.at < VID_CACHE_TTL_MS) {
-    logHit('vid', { src: src.split('/').pop(), ok: true, cached: 1 });
-    return { ok: true, master: hlsProxyUrl(req, cached.master, src), diag: { cached: 1 } };
+    logHit('vid', { src: src.split('/').pop(), ok: true, cached: 1, pv: pv || '', door: 'render' });
+    return { ok: true, master: hlsProxyUrl(req, cached.master, src, pv), diag: { cached: 1 } };
   }
   const page = await fetchFull(src, {
     referer: 'https://egydead.ca/',
@@ -1249,20 +1250,20 @@ async function relayVid(req, src) {
     if (bare) master = bare[0];
   }
   if (!master) {
-    logHit('vid', { src: src.split('/').pop(), ok: false, code: page.status });
+    logHit('vid', { src: src.split('/').pop(), ok: false, code: page.status, pv: pv || '', door: 'render' });
     return { ok: false, diag: { code: page.status, len: text.length }, error: 'no m3u8 in embed page' };
   }
   if (vidCache.size > 100) vidCache.clear();
   vidCache.set(src, { at: Date.now(), master });
-  logHit('vid', { src: src.split('/').pop(), ok: true, cached: 0 });
+  logHit('vid', { src: src.split('/').pop(), ok: true, cached: 0, pv: pv || '', door: 'render' });
   return {
     ok: true,
-    master: hlsProxyUrl(req, master, src),
+    master: hlsProxyUrl(req, master, src, pv),
     diag: { code: page.status, cached: 0 },
   };
 }
 
-async function relayHls(req, res, target, referer) {
+async function relayHls(req, res, target, referer, pv) {
   const parsed = new URL(target);
   if (!isVidHost(parsed.hostname)) {
     sendJson(res, 400, { ok: false, error: 'target host not allowed' });
@@ -1288,7 +1289,7 @@ async function relayHls(req, res, target, referer) {
     });
   } catch (e) {
     clearTimeout(timer);
-    logHit('hls', { err: String((e && e.message) || e).slice(0, 60) });
+    logHit('hls', { err: String((e && e.message) || e).slice(0, 60), pv: pv || '', door: 'render' });
     sendJson(res, 502, { ok: false, error: String((e && e.message) || e) });
     return;
   }
@@ -1299,7 +1300,7 @@ async function relayHls(req, res, target, referer) {
     clearTimeout(timer);
     if (up.status !== 200 || !text.startsWith('#EXTM3U')) {
       // Never rewrite an error page as if it were a playlist.
-      logHit('hls', { kind: 'playlist-err', status: up.status });
+      logHit('hls', { kind: 'playlist-err', status: up.status, pv: pv || '', door: 'render' });
       res.writeHead(up.status, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(text.slice(0, 500));
       return;
@@ -1311,7 +1312,7 @@ async function relayHls(req, res, target, referer) {
         return t.replace(/URI="([^"]+)"/g, (whole, uri) => {
           try {
             const abs = new URL(uri, target).toString();
-            return `URI="${hlsProxyUrl(req, abs, referer)}"`;
+            return `URI="${hlsProxyUrl(req, abs, referer, pv)}"`;
           } catch {
             return whole;
           }
@@ -1319,12 +1320,12 @@ async function relayHls(req, res, target, referer) {
       }
       try {
         const abs = new URL(t, target).toString();
-        return hlsProxyUrl(req, abs, referer);
+        return hlsProxyUrl(req, abs, referer, pv);
       } catch {
         return line;
       }
     }).join('\n');
-    logHit('hls', { kind: 'playlist', status: up.status, bytes: out.length });
+    logHit('hls', { kind: 'playlist', status: up.status, bytes: out.length, pv: pv || '', door: 'render' });
     res.writeHead(up.status, {
       'Content-Type': 'application/vnd.apple.mpegurl',
       'Cache-Control': 'no-cache',
@@ -1359,7 +1360,7 @@ async function relayHls(req, res, target, referer) {
   });
   rs.on('end', () => {
     clearTimeout(timer);
-    logHit('hls', { kind: 'segment', status: up.status, bytes: segBytes });
+    logHit('hls', { kind: 'segment', status: up.status, bytes: segBytes, pv: pv || '', door: 'render' });
   });
   rs.pipe(counter).pipe(res);
 }
@@ -1692,7 +1693,7 @@ async function handleRelayRequest(req, res, url) {
       return true;
     }
     try {
-      sendJson(res, 200, await relayVid(req, src));
+      sendJson(res, 200, await relayVid(req, src, url.searchParams.get('pv') || ''));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
@@ -1706,7 +1707,7 @@ async function handleRelayRequest(req, res, url) {
       return true;
     }
     try {
-      await relayHls(req, res, target, referer);
+      await relayHls(req, res, target, referer, url.searchParams.get('pv') || '');
     } catch (e) {
       if (!res.headersSent) {
         sendJson(res, 502, { ok: false, error: String((e && e.message) || e) });
