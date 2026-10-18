@@ -1271,6 +1271,12 @@ async function relayHls(req, res, target, referer) {
   if (isPlaylist) {
     const text = await up.text();
     clearTimeout(timer);
+    if (up.status !== 200 || !text.startsWith('#EXTM3U')) {
+      // Never rewrite an error page as if it were a playlist.
+      res.writeHead(up.status, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(text.slice(0, 500));
+      return;
+    }
     const out = text.split('\n').map((line) => {
       const t = line.trim();
       if (!t) return line;
@@ -1318,6 +1324,55 @@ async function relayHls(req, res, target, referer) {
   });
   rs.on('end', () => clearTimeout(timer));
   rs.pipe(res);
+}
+
+/**
+ * PROBE (2026-10-18): why did the proxied master fetch answer 403 while
+ * the dig (same server, seconds earlier) succeeded? One request performs
+ * the dig, then fetches the master with (a) minimal headers (UA+Referer)
+ * and (b) the full browser header set, and reads this service's egress
+ * IP twice — separating IP rotation from header completeness.
+ */
+async function relayVidTest(src) {
+  const out = { ips: [], dig: null, minimal: null, full: null };
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await fetch('https://api.ipify.org?format=json', { timeout: 10000 });
+      const j = await r.json();
+      out.ips.push(j.ip);
+    } catch (e) {
+      out.ips.push('err:' + String((e && e.message) || e).slice(0, 40));
+    }
+  }
+  const page = await fetchFull(src, {
+    referer: 'https://egydead.ca/',
+    timeout: 25000,
+    headers: { 'User-Agent': VID_UA },
+  });
+  const text = (page.text || '').replace(/\\\//g, '/');
+  const m = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/);
+  out.dig = { code: page.status, hasM3u8: !!m };
+  if (!m) return out;
+  const master = m[0];
+  try {
+    const r1 = await fetch(master, {
+      redirect: 'follow',
+      headers: { 'User-Agent': VID_UA, Referer: src },
+    });
+    out.minimal = { code: r1.status, head: (await r1.text()).slice(0, 40) };
+  } catch (e) {
+    out.minimal = { error: String((e && e.message) || e).slice(0, 60) };
+  }
+  try {
+    const r2 = await fetch(master, {
+      redirect: 'follow',
+      headers: { ...BROWSER_HEADERS, Referer: src },
+    });
+    out.full = { code: r2.status, head: (await r2.text()).slice(0, 40) };
+  } catch (e) {
+    out.full = { error: String((e && e.message) || e).slice(0, 60) };
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- routes
@@ -1579,6 +1634,19 @@ async function handleRelayRequest(req, res, url) {
     const ref = url.searchParams.get('ref') || '';
     try {
       sendJson(res, 200, await relayResolve(parsed.toString(), ref));
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
+  if (url.pathname === '/relay/vidtest') {
+    const src = url.searchParams.get('src');
+    if (!src) {
+      sendJson(res, 400, { ok: false, error: 'missing src param' });
+      return true;
+    }
+    try {
+      sendJson(res, 200, await relayVidTest(src));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
