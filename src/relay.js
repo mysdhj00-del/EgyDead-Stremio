@@ -894,7 +894,7 @@ async function relayResolve(target, ref) {
   }
   const res = await fetchFull(target, { timeout: 25000, referer });
   diag.code = res.status;
-  const text = (res.text || '').replace(/\\\//g, '/');
+  const text = (res.text || '').replace(/\\\//g, '/').replace(/\\\//g, '/').replace(/\\\//g, '/');
   const direct = [];
   const seen = new Set();
   const push = (u) => {
@@ -1241,7 +1241,7 @@ async function relayVid(req, src, pv) {
     timeout: 25000,
     headers: { 'User-Agent': VID_UA },
   });
-  const text = (page.text || '').replace(/\\\//g, '/');
+  const text = (page.text || '').replace(/\\\//g, '/').replace(/\\\//g, '/').replace(/\\\//g, '/');
   let master = null;
   const fileM = text.match(/file\s*:\s*["'](https?:[^"']+\.m3u8[^"']*)["']/);
   if (fileM) master = fileM[1];
@@ -1388,7 +1388,7 @@ async function relayVidTest(src) {
     timeout: 25000,
     headers: { 'User-Agent': VID_UA },
   });
-  const text = (page.text || '').replace(/\\\//g, '/');
+  const text = (page.text || '').replace(/\\\//g, '/').replace(/\\\//g, '/').replace(/\\\//g, '/');
   const m = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/);
   out.dig = { code: page.status, hasM3u8: !!m };
   if (!m) return out;
