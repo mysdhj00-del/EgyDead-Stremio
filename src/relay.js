@@ -1190,6 +1190,19 @@ const VID_UA =
 const vidCache = new Map(); // embed src -> { at, master }
 const VID_CACHE_TTL_MS = 30 * 60 * 1000;
 
+// Server-side hit log (2026-10-18): the user's phone verdicts carry no
+// diagnostics, so the relay records its own recent requests in memory —
+// one tap on his phone becomes fully visible here (did /relay/vid
+// arrive? did the player follow with the master, variants, segments?).
+// Read via GET /relay/hits?k=<HITS_KEY>. Operational data only:
+// timestamps, routes, the public embed id, statuses, byte counts.
+const HITS_KEY = 'saher-obs-7f3';
+const hitLog = [];
+function logHit(route, info) {
+  hitLog.push({ t: new Date().toISOString(), route, ...info });
+  if (hitLog.length > 120) hitLog.shift();
+}
+
 const b64e = (s) => Buffer.from(String(s), 'utf8').toString('base64url');
 const b64d = (s) => Buffer.from(String(s || ''), 'base64url').toString('utf8');
 
@@ -1215,6 +1228,7 @@ async function relayVid(req, src) {
   }
   const cached = vidCache.get(src);
   if (cached && Date.now() - cached.at < VID_CACHE_TTL_MS) {
+    logHit('vid', { src: src.split('/').pop(), ok: true, cached: 1 });
     return { ok: true, master: hlsProxyUrl(req, cached.master, src), diag: { cached: 1 } };
   }
   const page = await fetchFull(src, {
@@ -1231,10 +1245,12 @@ async function relayVid(req, src) {
     if (bare) master = bare[0];
   }
   if (!master) {
+    logHit('vid', { src: src.split('/').pop(), ok: false, code: page.status });
     return { ok: false, diag: { code: page.status, len: text.length }, error: 'no m3u8 in embed page' };
   }
   if (vidCache.size > 100) vidCache.clear();
   vidCache.set(src, { at: Date.now(), master });
+  logHit('vid', { src: src.split('/').pop(), ok: true, cached: 0 });
   return {
     ok: true,
     master: hlsProxyUrl(req, master, src),
@@ -1268,6 +1284,7 @@ async function relayHls(req, res, target, referer) {
     });
   } catch (e) {
     clearTimeout(timer);
+    logHit('hls', { err: String((e && e.message) || e).slice(0, 60) });
     sendJson(res, 502, { ok: false, error: String((e && e.message) || e) });
     return;
   }
@@ -1278,6 +1295,7 @@ async function relayHls(req, res, target, referer) {
     clearTimeout(timer);
     if (up.status !== 200 || !text.startsWith('#EXTM3U')) {
       // Never rewrite an error page as if it were a playlist.
+      logHit('hls', { kind: 'playlist-err', status: up.status });
       res.writeHead(up.status, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(text.slice(0, 500));
       return;
@@ -1302,6 +1320,7 @@ async function relayHls(req, res, target, referer) {
         return line;
       }
     }).join('\n');
+    logHit('hls', { kind: 'playlist', status: up.status, bytes: out.length });
     res.writeHead(up.status, {
       'Content-Type': 'application/vnd.apple.mpegurl',
       'Cache-Control': 'no-cache',
@@ -1321,14 +1340,24 @@ async function relayHls(req, res, target, referer) {
     res.end();
     return;
   }
-  const { Readable } = require('stream');
+  const { Readable, Transform } = require('stream');
   const rs = Readable.fromWeb(up.body);
+  let segBytes = 0;
+  const counter = new Transform({
+    transform(chunk, enc, cb) {
+      segBytes += chunk.length;
+      cb(null, chunk);
+    },
+  });
   rs.on('error', () => {
     clearTimeout(timer);
     try { res.end(); } catch { /* closed */ }
   });
-  rs.on('end', () => clearTimeout(timer));
-  rs.pipe(res);
+  rs.on('end', () => {
+    clearTimeout(timer);
+    logHit('hls', { kind: 'segment', status: up.status, bytes: segBytes });
+  });
+  rs.pipe(counter).pipe(res);
 }
 
 /**
@@ -1642,6 +1671,14 @@ async function handleRelayRequest(req, res, url) {
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
+    return true;
+  }
+  if (url.pathname === '/relay/hits') {
+    if (url.searchParams.get('k') !== HITS_KEY) {
+      sendJson(res, 403, { ok: false, error: 'bad key' });
+      return true;
+    }
+    sendJson(res, 200, { ok: true, hits: hitLog });
     return true;
   }
   if (url.pathname === '/relay/vid') {
