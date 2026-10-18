@@ -1256,10 +1256,15 @@ async function relayHls(req, res, target, referer) {
   });
   let up;
   try {
+    // The FULL browser header set, identical to the dig's — measured by
+    // the /relay/vidtest probe (2026-10-18): with UA+Referer alone the
+    // CDN answers 403 even from the digging IP; with the complete set
+    // (sec-ch-ua, Accept, Accept-Language...) it answers 200. The token
+    // evidently validates against the dig's whole header profile.
     up = await fetch(target, {
       redirect: 'follow',
       signal: controller.signal,
-      headers: { 'User-Agent': VID_UA, Referer: referer || 'https://egydead.ca/' },
+      headers: { ...BROWSER_HEADERS, Referer: referer || 'https://egydead.ca/' },
     });
   } catch (e) {
     clearTimeout(timer);
@@ -1634,19 +1639,6 @@ async function handleRelayRequest(req, res, url) {
     const ref = url.searchParams.get('ref') || '';
     try {
       sendJson(res, 200, await relayResolve(parsed.toString(), ref));
-    } catch (e) {
-      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
-    }
-    return true;
-  }
-  if (url.pathname === '/relay/vidtest') {
-    const src = url.searchParams.get('src');
-    if (!src) {
-      sendJson(res, 400, { ok: false, error: 'missing src param' });
-      return true;
-    }
-    try {
-      sendJson(res, 200, await relayVidTest(src));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
     }
