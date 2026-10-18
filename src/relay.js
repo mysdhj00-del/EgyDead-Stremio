@@ -1170,6 +1170,156 @@ async function relayBrowserTest(target) {
   }
 }
 
+// ------------------------------------------------- EgyDead .ca stream proxy
+// (2026-10-18) egybestvid stream tokens are bound to (fetching IP +
+// User-Agent) — measured live: the playlist/variants/segments answer 200
+// only when every request carries the SAME IP and the SAME UA that dug
+// the embed, and 403 otherwise. The CloudStream player cannot be made
+// to present the dig's identity reliably on the user's device, so the
+// provider now plays through this proxy instead: the phone talks ONLY
+// to this server, and this server performs the dig AND every playlist /
+// segment fetch with ONE fixed identity (its own IP + VID_UA below),
+// which satisfies the binding entirely server-side.
+//   GET /relay/vid?src=<urlencoded egybestvid embed URL>
+//       -> { ok, master: <proxied master playlist URL>, diag }
+//   GET /relay/hls?u=<base64url target>&r=<base64url referer>
+//       -> the target fetched with the proxy identity; playlists are
+//          rewritten so every resource resolves back through /relay/hls.
+const VID_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const vidCache = new Map(); // embed src -> { at, master }
+const VID_CACHE_TTL_MS = 30 * 60 * 1000;
+
+const b64e = (s) => Buffer.from(String(s), 'utf8').toString('base64url');
+const b64d = (s) => Buffer.from(String(s || ''), 'base64url').toString('utf8');
+
+function proxyBase(req) {
+  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host = req.headers.host || 'egydead-stremio.onrender.com';
+  return `${proto}://${host}`;
+}
+
+function hlsProxyUrl(req, target, referer) {
+  return `${proxyBase(req)}/relay/hls?u=${encodeURIComponent(b64e(target))}&r=${encodeURIComponent(b64e(referer))}`;
+}
+
+function isVidHost(host) {
+  const h = (host || '').toLowerCase();
+  return h === 'egybestvid.com' || h.endsWith('.egybestvid.com');
+}
+
+async function relayVid(req, src) {
+  const parsed = new URL(src);
+  if (!isVidHost(parsed.hostname)) {
+    return { ok: false, error: 'src must be an egybestvid embed URL' };
+  }
+  const cached = vidCache.get(src);
+  if (cached && Date.now() - cached.at < VID_CACHE_TTL_MS) {
+    return { ok: true, master: hlsProxyUrl(req, cached.master, src), diag: { cached: 1 } };
+  }
+  const page = await fetchFull(src, {
+    referer: 'https://egydead.ca/',
+    timeout: 25000,
+    headers: { 'User-Agent': VID_UA },
+  });
+  const text = (page.text || '').replace(/\\\//g, '/');
+  let master = null;
+  const fileM = text.match(/file\s*:\s*["'](https?:[^"']+\.m3u8[^"']*)["']/);
+  if (fileM) master = fileM[1];
+  if (!master) {
+    const bare = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/);
+    if (bare) master = bare[0];
+  }
+  if (!master) {
+    return { ok: false, diag: { code: page.status, len: text.length }, error: 'no m3u8 in embed page' };
+  }
+  if (vidCache.size > 100) vidCache.clear();
+  vidCache.set(src, { at: Date.now(), master });
+  return {
+    ok: true,
+    master: hlsProxyUrl(req, master, src),
+    diag: { code: page.status, cached: 0 },
+  };
+}
+
+async function relayHls(req, res, target, referer) {
+  const parsed = new URL(target);
+  if (!isVidHost(parsed.hostname)) {
+    sendJson(res, 400, { ok: false, error: 'target host not allowed' });
+    return;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  res.on('close', () => {
+    clearTimeout(timer);
+    controller.abort();
+  });
+  let up;
+  try {
+    up = await fetch(target, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': VID_UA, Referer: referer || 'https://egydead.ca/' },
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    sendJson(res, 502, { ok: false, error: String((e && e.message) || e) });
+    return;
+  }
+  const ctype = (up.headers.get('content-type') || '').toLowerCase();
+  const isPlaylist = target.includes('.m3u8') || ctype.includes('mpegurl');
+  if (isPlaylist) {
+    const text = await up.text();
+    clearTimeout(timer);
+    const out = text.split('\n').map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      if (t.startsWith('#')) {
+        return t.replace(/URI="([^"]+)"/g, (whole, uri) => {
+          try {
+            const abs = new URL(uri, target).toString();
+            return `URI="${hlsProxyUrl(req, abs, referer)}"`;
+          } catch {
+            return whole;
+          }
+        });
+      }
+      try {
+        const abs = new URL(t, target).toString();
+        return hlsProxyUrl(req, abs, referer);
+      } catch {
+        return line;
+      }
+    }).join('\n');
+    res.writeHead(up.status, {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'no-cache',
+    });
+    res.end(out);
+    return;
+  }
+  const headers = {
+    'Content-Type': ctype || 'application/octet-stream',
+    'Cache-Control': 'no-cache',
+  };
+  const len = up.headers.get('content-length');
+  if (len) headers['Content-Length'] = len;
+  res.writeHead(up.status, headers);
+  if (!up.body) {
+    clearTimeout(timer);
+    res.end();
+    return;
+  }
+  const { Readable } = require('stream');
+  const rs = Readable.fromWeb(up.body);
+  rs.on('error', () => {
+    clearTimeout(timer);
+    try { res.end(); } catch { /* closed */ }
+  });
+  rs.on('end', () => clearTimeout(timer));
+  rs.pipe(res);
+}
+
 // ---------------------------------------------------------------- routes
 function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1431,6 +1581,35 @@ async function handleRelayRequest(req, res, url) {
       sendJson(res, 200, await relayResolve(parsed.toString(), ref));
     } catch (e) {
       sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
+  if (url.pathname === '/relay/vid') {
+    const src = url.searchParams.get('src');
+    if (!src) {
+      sendJson(res, 400, { ok: false, error: 'missing src param' });
+      return true;
+    }
+    try {
+      sendJson(res, 200, await relayVid(req, src));
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+    return true;
+  }
+  if (url.pathname === '/relay/hls') {
+    const target = b64d(url.searchParams.get('u'));
+    const referer = b64d(url.searchParams.get('r'));
+    if (!target) {
+      sendJson(res, 400, { ok: false, error: 'missing u param' });
+      return true;
+    }
+    try {
+      await relayHls(req, res, target, referer);
+    } catch (e) {
+      if (!res.headersSent) {
+        sendJson(res, 502, { ok: false, error: String((e && e.message) || e) });
+      }
     }
     return true;
   }
